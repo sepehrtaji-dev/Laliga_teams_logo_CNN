@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
+from torchvision import models
 
 import matplotlib.pyplot as plt
 
@@ -16,9 +17,9 @@ train_dir = r"split_data/train"
 val_dir   = r"split_data/val"
 test_dir  = r"split_data/test"
 
-IMG_SIZE = 128
+IMG_SIZE = 224          # ResNet expects 224x224
 BATCH_SIZE = 16
-EPOCHS = 50
+EPOCHS = 30
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", DEVICE)
@@ -33,7 +34,7 @@ def build_dataframe(root_dir):
         if not os.path.isdir(cls_folder):
             continue
         for fname in os.listdir(cls_folder):
-            if fname.lower().endswith((".png", ".jpg", ".jpeg")):
+            if fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
                 records.append({
                     "filepath": os.path.join(cls_folder, fname),
                     "label_name": cls,
@@ -70,24 +71,32 @@ class LogoDataset(Dataset):
 
         return img, label
 
+# Stronger augmentation for better real-world generalization
 train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomRotation(30),
-    transforms.RandomAffine(degrees=0, translate=(0.2, 0.2), scale=(0.7, 1.3)),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
-    transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
-    transforms.RandomApply([transforms.GaussianBlur(3)], p=0.2),
+    transforms.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
+    transforms.RandomCrop(IMG_SIZE),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(25),
+    transforms.RandomAffine(
+        degrees=0,
+        translate=(0.15, 0.15),
+        scale=(0.8, 1.2),
+        shear=10
+    ),
+    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+    transforms.RandomPerspective(distortion_scale=0.3, p=0.4),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
     transforms.ToTensor(),
-    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
+    transforms.RandomErasing(p=0.25, scale=(0.02, 0.15)),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                          std=[0.229, 0.224, 0.225])
+                         std=[0.229, 0.224, 0.225])
 ])
 
 val_test_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                          std=[0.229, 0.224, 0.225])
+                         std=[0.229, 0.224, 0.225])
 ])
 
 train_dataset = LogoDataset(train_df, transform=train_transform)
@@ -98,54 +107,39 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, nu
 val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-class LaLigaCNN(nn.Module):
-    def __init__(self, num_classes=3):
-        super(LaLigaCNN, self).__init__()
 
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
+def create_model(num_classes):
+    """Create a pretrained ResNet18 and replace the final layer."""
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
+    # Freeze early layers (optional but helps with small datasets)
+    for param in list(model.parameters())[:-20]:
+        param.requires_grad = False
 
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
+    # Replace the classifier head
+    in_features = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(in_features, 256),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.3),
+        nn.Linear(256, num_classes)
+    )
+    return model
 
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-        )
 
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256 * 8 * 8, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
-
-model = LaLigaCNN(num_classes=NUM_CLASSES).to(DEVICE)
+model = create_model(NUM_CLASSES).to(DEVICE)
 print(model)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+optimizer = optim.AdamW(
+    filter(lambda p: p.requires_grad, model.parameters()),
+    lr=LR,
+    weight_decay=1e-4
+)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=3, verbose=True
+)
 
 def run_epoch(model, loader, criterion, optimizer=None):
     is_train = optimizer is not None
@@ -178,10 +172,11 @@ def run_epoch(model, loader, criterion, optimizer=None):
     epoch_acc = correct / total
     return epoch_loss, epoch_acc
 
+
 history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
 best_val_acc = 0.0
-patience = 8
+patience = 7
 patience_counter = 0
 
 for epoch in range(EPOCHS):
@@ -205,7 +200,13 @@ for epoch in range(EPOCHS):
 
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), "best_laliga_model.pth")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'class_to_idx': class_to_idx,
+            'idx_to_class': idx_to_class,
+            'num_classes': NUM_CLASSES
+        }, "best_laliga_model.pth")
+        print(f"  → Saved new best model (val_acc={val_acc:.4f})")
         patience_counter = 0
     else:
         patience_counter += 1
@@ -213,7 +214,9 @@ for epoch in range(EPOCHS):
             print("Early stopping triggered.")
             break
 
-model.load_state_dict(torch.load("best_laliga_model.pth"))
+# Load best model and evaluate on test set
+checkpoint = torch.load("best_laliga_model.pth", map_location=DEVICE)
+model.load_state_dict(checkpoint['model_state_dict'])
 test_loss, test_acc = run_epoch(model, test_loader, criterion, optimizer=None)
 print(f"\nTest Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:.2f}%")
 
@@ -221,16 +224,16 @@ history_df = pd.DataFrame(history)
 history_df.to_csv("training_history.csv", index_label="epoch")
 print(history_df.tail())
 
-plt.figure(figsize=(12,4))
+plt.figure(figsize=(12, 4))
 
-plt.subplot(1,2,1)
+plt.subplot(1, 2, 1)
 plt.plot(history_df["train_acc"], label="Train Acc")
 plt.plot(history_df["val_acc"], label="Val Acc")
 plt.title("Accuracy")
 plt.xlabel("Epoch")
 plt.legend()
 
-plt.subplot(1,2,2)
+plt.subplot(1, 2, 2)
 plt.plot(history_df["train_loss"], label="Train Loss")
 plt.plot(history_df["val_loss"], label="Val Loss")
 plt.title("Loss")
@@ -241,5 +244,11 @@ plt.tight_layout()
 plt.savefig("training_history.png")
 plt.show()
 
-torch.save(model.state_dict(), "laliga_logo_cnn_final.pth")
+# Also save a final version
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'class_to_idx': class_to_idx,
+    'idx_to_class': idx_to_class,
+    'num_classes': NUM_CLASSES
+}, "laliga_logo_cnn_final.pth")
 print("Final model saved as laliga_logo_cnn_final.pth")
